@@ -1,0 +1,45 @@
+{
+  "name": "@olympio/quality-config",
+  "version": "1.0.0",
+  "description": "Unified quality, security and LGPD compliance tooling for multi-stack projects",
+  "main": "index.js",
+  "bin": {
+    "quality-config": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "configs/",
+    "workflows/",
+    "scripts/",
+    "templates/",
+    "index.js"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "lint": "eslint bin/ index.js"
+  },
+  "keywords": [
+    "sonarqube",
+    "quality",
+    "lgpd",
+    "security",
+    "compliance",
+    "devops"
+  ],
+  "author": "Olympio",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olympio-startup/quality-config.git"
+  },
+  "homepage": "https://github.com/olympio-startup/quality-config#readme",
+  "bugs": {
+    "url": "https://github.com/olympio-startup/quality-config/issues"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

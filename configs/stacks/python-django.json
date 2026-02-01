@@ -1,0 +1,10 @@
+{
+  "lang": "py",
+  "sonar": {
+    "sources": ".",
+    "tests": ".",
+    "testInclusions": "**/test_*.py,**/*_test.py,**/tests.py",
+    "exclusions": "**/migrations/**,**/venv/**,**/.venv/**,**/env/**,**/__pycache__/**,**/static/**,**/media/**,**/manage.py,**/wsgi.py,**/asgi.py",
+    "extraProperties": "# Python\nsonar.python.coverage.reportPaths=coverage.xml\nsonar.python.version=3.11\nsonar.language=py"
+  }
+}

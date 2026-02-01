@@ -1,0 +1,11 @@
+{
+  "lang": "js",
+  "nodeVersion": "18",
+  "sonar": {
+    "sources": "src,app",
+    "tests": "src,__tests__",
+    "testInclusions": "**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx",
+    "exclusions": "**/node_modules/**,**/android/**,**/ios/**,**/*.config.ts,**/*.config.js,**/coverage/**,**/.expo/**",
+    "extraProperties": "# JavaScript/TypeScript (React Native)\nsonar.javascript.lcov.reportPaths=coverage/lcov.info\nsonar.typescript.tsconfigPath=tsconfig.json\nsonar.javascript.file.suffixes=.js,.jsx\nsonar.typescript.file.suffixes=.ts,.tsx"
+  }
+}

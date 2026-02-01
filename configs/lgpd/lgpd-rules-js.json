@@ -1,0 +1,103 @@
+{
+  "name": "LGPD/GDPR Compliance Rules (JavaScript/TypeScript)",
+  "description": "Custom rules for LGPD and GDPR compliance in JS/TS projects",
+  "rules": [
+    {
+      "key": "typescript:S2068",
+      "name": "Credentials should not be hardcoded",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S5852",
+      "name": "Regex should be safe against ReDoS",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S2255",
+      "name": "Cookies must be secure",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S5443",
+      "name": "Sensitive data must not be stored without encryption",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S5332",
+      "name": "URLs must use HTTPS",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S1313",
+      "name": "IPs should not be hardcoded",
+      "severity": "MAJOR",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S2245",
+      "name": "Use cryptographically secure random number generators",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S4507",
+      "name": "Logs should not contain sensitive data",
+      "severity": "CRITICAL",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S5122",
+      "name": "CORS must be configured correctly",
+      "severity": "BLOCKER",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S2077",
+      "name": "SQL queries should not be vulnerable to injection",
+      "severity": "BLOCKER",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    },
+    {
+      "key": "typescript:S5131",
+      "name": "Output should be sanitized to prevent XSS",
+      "severity": "BLOCKER",
+      "type": "VULNERABILITY",
+      "lgpd_article": "Art. 46 - Information security"
+    }
+  ],
+  "lgpd_compliance_checklist": {
+    "data_protection": [
+      "Encryption of sensitive data",
+      "Secure transmission (HTTPS)",
+      "Secure storage",
+      "Logs without PII"
+    ],
+    "user_rights": [
+      "Explicit consent",
+      "Right to be forgotten",
+      "Data portability",
+      "Data access"
+    ],
+    "security": [
+      "Strong authentication",
+      "Access control",
+      "Audit logging",
+      "Backup and recovery"
+    ]
+  }
+}
