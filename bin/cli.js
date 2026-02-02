@@ -31,6 +31,7 @@ Usage:
   quality-config hook install       Install pre-push git hook
   quality-config hook uninstall     Remove pre-push git hook
   quality-config doctor             Check if everything is configured correctly
+  quality-config export              Export SonarQube report as HTML (to share with clients)
   quality-config report             Generate LGPD compliance report
   quality-config update             Update configs to latest version
 
@@ -417,6 +418,299 @@ function cmdDoctor() {
   console.log(`\n${issues === 0 ? 'All checks passed!' : `${issues} issue(s) found.`}\n`);
 }
 
+function sonarApiFetch(endpoint, token, sonarUrl = 'http://localhost:9000') {
+  try {
+    const result = execSync(
+      `curl -sf -H "Authorization: Bearer ${token}" "${sonarUrl}${endpoint}"`,
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }
+    );
+    return JSON.parse(result);
+  } catch {
+    return null;
+  }
+}
+
+function severityBadge(severity) {
+  const colors = {
+    BLOCKER: '#d4333f', CRITICAL: '#d4333f', MAJOR: '#ed7d20',
+    MINOR: '#eabe06', INFO: '#2d9fd9',
+  };
+  const color = colors[severity] || '#888';
+  return `<span style="background:${color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600">${severity}</span>`;
+}
+
+function typeBadge(type) {
+  const labels = {
+    BUG: 'Bug', VULNERABILITY: 'Vulnerability', CODE_SMELL: 'Code Smell',
+    SECURITY_HOTSPOT: 'Hotspot',
+  };
+  return labels[type] || type;
+}
+
+function qualityGateIcon(status) {
+  if (status === 'OK') return '<span style="color:#2ea44f;font-size:24px">PASSED</span>';
+  if (status === 'ERROR') return '<span style="color:#d4333f;font-size:24px">FAILED</span>';
+  return `<span style="color:#888;font-size:24px">${status}</span>`;
+}
+
+async function cmdExport() {
+  const cwd = process.cwd();
+  const projectKey = getProjectKey(cwd);
+  const token = getSonarToken(cwd);
+  const sonarUrl = process.env.SONAR_HOST_URL || 'http://localhost:9000';
+
+  if (!token) {
+    console.error('Error: No SonarQube token found. Run "quality-config scan" first or save token to .sonar-token');
+    process.exit(1);
+  }
+
+  console.log('\n@olympio/quality-config - Export Report\n');
+  console.log(`  Project: ${projectKey}`);
+  console.log(`  Server: ${sonarUrl}`);
+  console.log('  [..] Fetching data from SonarQube...\n');
+
+  // Fetch all data
+  const qualityGate = sonarApiFetch(`/api/qualitygates/project_status?projectKey=${projectKey}`, token, sonarUrl);
+  const measures = sonarApiFetch(
+    `/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density,ncloc,sqale_index,security_rating,reliability_rating,sqale_rating,alert_status`,
+    token, sonarUrl
+  );
+  const issues = sonarApiFetch(
+    `/api/issues/search?componentKeys=${projectKey}&ps=500&s=SEVERITY&asc=false&statuses=OPEN,CONFIRMED,REOPENED`,
+    token, sonarUrl
+  );
+  const hotspots = sonarApiFetch(
+    `/api/hotspots/search?projectKey=${projectKey}&ps=500`,
+    token, sonarUrl
+  );
+
+  if (!measures || !measures.component) {
+    console.error('  [error] Could not fetch project data. Is SonarQube running? Has the project been scanned?');
+    process.exit(1);
+  }
+
+  // Parse measures into a map
+  const metricsMap = {};
+  for (const m of measures.component.measures || []) {
+    metricsMap[m.metric] = m.value;
+  }
+
+  const ratingLabels = { '1.0': 'A', '2.0': 'B', '3.0': 'C', '4.0': 'D', '5.0': 'E' };
+  const ratingColors = { 'A': '#2ea44f', 'B': '#84bb4c', 'C': '#eabe06', 'D': '#ed7d20', 'E': '#d4333f' };
+
+  function ratingBadge(value) {
+    const letter = ratingLabels[value] || value || '-';
+    const color = ratingColors[letter] || '#888';
+    return `<span style="background:${color};color:#fff;padding:4px 12px;border-radius:4px;font-size:18px;font-weight:700">${letter}</span>`;
+  }
+
+  // Quality gate conditions
+  const gateStatus = qualityGate?.projectStatus?.status || 'UNKNOWN';
+  const gateConditions = qualityGate?.projectStatus?.conditions || [];
+
+  // Group issues by severity
+  const issueList = issues?.issues || [];
+  const issuesBySeverity = {};
+  for (const issue of issueList) {
+    const sev = issue.severity || 'UNKNOWN';
+    if (!issuesBySeverity[sev]) issuesBySeverity[sev] = [];
+    issuesBySeverity[sev].push(issue);
+  }
+
+  // Group issues by type
+  const issuesByType = {};
+  for (const issue of issueList) {
+    const t = issue.type || 'UNKNOWN';
+    if (!issuesByType[t]) issuesByType[t] = 0;
+    issuesByType[t]++;
+  }
+
+  // Hotspots
+  const hotspotList = hotspots?.hotspots || [];
+
+  const now = new Date();
+  const displayDate = now.toLocaleDateString('pt-BR') + ' ' + now.toLocaleTimeString('pt-BR');
+  const projectName = measures.component.name || projectKey;
+
+  // Build issue rows (top 100)
+  const topIssues = issueList.slice(0, 100);
+  const issueRows = topIssues.map(issue => {
+    const file = (issue.component || '').replace(`${projectKey}:`, '');
+    return `<tr>
+      <td>${severityBadge(issue.severity)}</td>
+      <td>${typeBadge(issue.type)}</td>
+      <td>${escapeHtml(issue.message || '')}</td>
+      <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${issue.line || ''}</td>
+    </tr>`;
+  }).join('\n');
+
+  // Build hotspot rows
+  const hotspotRows = hotspotList.map(h => {
+    const file = (h.component || '').replace(`${projectKey}:`, '');
+    return `<tr>
+      <td>${severityBadge(h.vulnerabilityProbability || 'MEDIUM')}</td>
+      <td>${escapeHtml(h.securityCategory || '')}</td>
+      <td>${escapeHtml(h.message || '')}</td>
+      <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${h.line || ''}</td>
+      <td>${h.status || ''}</td>
+    </tr>`;
+  }).join('\n');
+
+  // Quality gate condition rows
+  const gateRows = gateConditions.map(c => {
+    const icon = c.status === 'OK' ? '&#10003;' : '&#10007;';
+    const color = c.status === 'OK' ? '#2ea44f' : '#d4333f';
+    return `<tr>
+      <td style="color:${color};font-weight:bold">${icon}</td>
+      <td>${escapeHtml(c.metricKey)}</td>
+      <td>${c.actualValue || '-'}</td>
+      <td>${c.comparator || ''} ${c.errorThreshold || ''}</td>
+      <td style="color:${color};font-weight:bold">${c.status}</td>
+    </tr>`;
+  }).join('\n');
+
+  const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quality Report - ${escapeHtml(projectName)}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #333; background: #f5f5f5; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 40px; border-radius: 12px; margin-bottom: 24px; }
+  .header h1 { font-size: 28px; margin-bottom: 8px; }
+  .header p { opacity: 0.8; font-size: 14px; }
+  .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .card h2 { font-size: 18px; margin-bottom: 16px; color: #1a1a2e; border-bottom: 2px solid #f0f0f0; padding-bottom: 8px; }
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+  .metric { text-align: center; padding: 20px; background: #fafafa; border-radius: 8px; }
+  .metric .value { font-size: 32px; font-weight: 700; color: #1a1a2e; }
+  .metric .label { font-size: 13px; color: #666; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #f8f8f8; text-align: left; padding: 10px 12px; font-weight: 600; border-bottom: 2px solid #eee; }
+  td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+  tr:hover { background: #fafafa; }
+  .gate-banner { padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 16px; }
+  .gate-passed { background: #e6f9e6; border: 1px solid #2ea44f; }
+  .gate-failed { background: #fde8e8; border: 1px solid #d4333f; }
+  .summary-bar { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; margin: 16px 0; }
+  .summary-item { text-align: center; }
+  .summary-item .num { font-size: 24px; font-weight: 700; }
+  .summary-item .lbl { font-size: 12px; color: #666; }
+  .footer { text-align: center; padding: 24px; color: #999; font-size: 12px; }
+  @media print { body { background: #fff; } .container { padding: 0; } .card { box-shadow: none; border: 1px solid #eee; } }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <h1>${escapeHtml(projectName)} - Quality Report</h1>
+  <p>Generated on ${displayDate} by @olympio/quality-config</p>
+  <p>Lines of Code: ${Number(metricsMap.ncloc || 0).toLocaleString('pt-BR')}</p>
+</div>
+
+<div class="card">
+  <div class="gate-banner ${gateStatus === 'OK' ? 'gate-passed' : 'gate-failed'}">
+    <div style="font-size:14px;font-weight:600;margin-bottom:8px">QUALITY GATE</div>
+    ${qualityGateIcon(gateStatus)}
+  </div>
+  ${gateConditions.length > 0 ? `
+  <table>
+    <thead><tr><th></th><th>Metric</th><th>Value</th><th>Threshold</th><th>Status</th></tr></thead>
+    <tbody>${gateRows}</tbody>
+  </table>` : ''}
+</div>
+
+<div class="card">
+  <h2>Overview</h2>
+  <div class="metrics-grid">
+    <div class="metric">
+      <div class="value">${metricsMap.bugs || '0'}</div>
+      <div class="label">Bugs</div>
+      <div style="margin-top:8px">${ratingBadge(metricsMap.reliability_rating)}</div>
+    </div>
+    <div class="metric">
+      <div class="value">${metricsMap.vulnerabilities || '0'}</div>
+      <div class="label">Vulnerabilities</div>
+      <div style="margin-top:8px">${ratingBadge(metricsMap.security_rating)}</div>
+    </div>
+    <div class="metric">
+      <div class="value">${metricsMap.code_smells || '0'}</div>
+      <div class="label">Code Smells</div>
+      <div style="margin-top:8px">${ratingBadge(metricsMap.sqale_rating)}</div>
+    </div>
+    <div class="metric">
+      <div class="value">${metricsMap.security_hotspots || '0'}</div>
+      <div class="label">Security Hotspots</div>
+    </div>
+    <div class="metric">
+      <div class="value">${metricsMap.coverage ? metricsMap.coverage + '%' : 'N/A'}</div>
+      <div class="label">Coverage</div>
+    </div>
+    <div class="metric">
+      <div class="value">${metricsMap.duplicated_lines_density ? metricsMap.duplicated_lines_density + '%' : 'N/A'}</div>
+      <div class="label">Duplications</div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Issues by Type</h2>
+  <div class="summary-bar">
+    ${Object.entries(issuesByType).map(([type, count]) =>
+      `<div class="summary-item"><div class="num">${count}</div><div class="lbl">${typeBadge(type)}</div></div>`
+    ).join('')}
+  </div>
+</div>
+
+${hotspotList.length > 0 ? `
+<div class="card">
+  <h2>Security Hotspots (${hotspotList.length})</h2>
+  <table>
+    <thead><tr><th>Risk</th><th>Category</th><th>Description</th><th>File</th><th>Status</th></tr></thead>
+    <tbody>${hotspotRows}</tbody>
+  </table>
+</div>` : ''}
+
+<div class="card">
+  <h2>Issues (top ${topIssues.length} of ${issueList.length})</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Type</th><th>Description</th><th>File</th></tr></thead>
+    <tbody>${issueRows}</tbody>
+  </table>
+</div>
+
+<div class="footer">
+  Generated by @olympio/quality-config | ${displayDate}
+</div>
+
+</div>
+</body>
+</html>`;
+
+  const reportDir = path.join(cwd, 'reports');
+  ensureDir(reportDir);
+  const dateSlug = now.toISOString().slice(0, 10);
+  const reportFile = path.join(reportDir, `quality-report-${projectKey}-${dateSlug}.html`);
+  fs.writeFileSync(reportFile, html, 'utf8');
+
+  console.log(`  [ok] Report exported: ${path.relative(cwd, reportFile)}`);
+  console.log(`  Open in browser or send to client.\n`);
+
+  // Try to open in browser
+  try {
+    const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+    execSync(`${openCmd} "${reportFile}"`, { stdio: 'ignore' });
+  } catch {}
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function cmdReport() {
   const cwd = process.cwd();
   const reportDir = path.join(cwd, 'reports', 'lgpd');
@@ -527,6 +821,9 @@ switch (command) {
     break;
   case 'doctor':
     cmdDoctor();
+    break;
+  case 'export':
+    cmdExport();
     break;
   case 'report':
     cmdReport();
