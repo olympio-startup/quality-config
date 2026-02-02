@@ -33,6 +33,9 @@ npx quality-config doctor
 
 # 4. Run scan manually
 npx quality-config scan
+
+# 5. Export a shareable HTML report (for clients)
+npx quality-config export
 ```
 
 ## Commands
@@ -101,6 +104,25 @@ Checks if all quality configs are present and valid. Verifies Docker, git hooks,
 ```bash
 npx quality-config doctor
 ```
+
+### `quality-config export`
+
+Exports a **single self-contained HTML report** in `reports/` (ready to share with clients). The report includes **Quality Gate**, key metrics (bugs, vulnerabilities, code smells, hotspots, coverage, duplications), **ratings (A–E)**, **hotspots table**, and **top issues** with file + line. It also includes **LGPD checks** and basic **dependency audit** (when applicable).
+
+```bash
+npx quality-config export
+```
+
+**Output:**
+
+- Generates: `reports/quality-report-<projectKey>-YYYY-MM-DD.html`
+- Tries to open the file automatically (macOS/Windows/Linux)
+- Includes print CSS (use Ctrl+P to generate PDF)
+
+**Notes:**
+
+- Uses `SONAR_HOST_URL` when set; otherwise defaults to `http://localhost:9000`
+- Needs a Sonar token (it will use `.sonar-token` if present; otherwise it will try to generate one when running against local SonarQube with default credentials)
 
 ### `quality-config report`
 

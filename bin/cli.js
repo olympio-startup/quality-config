@@ -464,15 +464,15 @@ async function cmdExport() {
     process.exit(1);
   }
 
-  console.log('\n@olympio/quality-config - Export Report\n');
+  console.log('\n@olympio/quality-config - Full Project Report\n');
   console.log(`  Project: ${projectKey}`);
-  console.log(`  Server: ${sonarUrl}`);
-  console.log('  [..] Fetching data from SonarQube...\n');
+  console.log(`  Server: ${sonarUrl}\n`);
 
-  // Fetch all data
+  // ── 1. SonarQube data ──
+  console.log('  [..] Fetching SonarQube data...');
   const qualityGate = sonarApiFetch(`/api/qualitygates/project_status?projectKey=${projectKey}`, token, sonarUrl);
   const measures = sonarApiFetch(
-    `/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density,ncloc,sqale_index,security_rating,reliability_rating,sqale_rating,alert_status`,
+    `/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density,ncloc,sqale_index,sqale_debt_ratio,security_rating,reliability_rating,sqale_rating,alert_status,complexity,cognitive_complexity,duplicated_blocks,duplicated_files,files,functions,classes,statements`,
     token, sonarUrl
   );
   const issues = sonarApiFetch(
@@ -485,134 +485,319 @@ async function cmdExport() {
   );
 
   if (!measures || !measures.component) {
-    console.error('  [error] Could not fetch project data. Is SonarQube running? Has the project been scanned?');
+    console.error('  [error] Could not fetch project data. Is SonarQube running?');
     process.exit(1);
   }
 
-  // Parse measures into a map
   const metricsMap = {};
   for (const m of measures.component.measures || []) {
     metricsMap[m.metric] = m.value;
   }
 
-  const ratingLabels = { '1.0': 'A', '2.0': 'B', '3.0': 'C', '4.0': 'D', '5.0': 'E' };
-  const ratingColors = { 'A': '#2ea44f', 'B': '#84bb4c', 'C': '#eabe06', 'D': '#ed7d20', 'E': '#d4333f' };
+  // ── 2. Dependency audit (npm) ──
+  console.log('  [..] Analyzing dependencies...');
+  let npmAudit = null;
+  let npmOutdated = null;
+  let pkgJson = null;
+  let pkgLockExists = false;
 
-  function ratingBadge(value) {
-    const letter = ratingLabels[value] || value || '-';
-    const color = ratingColors[letter] || '#888';
-    return `<span style="background:${color};color:#fff;padding:4px 12px;border-radius:4px;font-size:18px;font-weight:700">${letter}</span>`;
+  // Find package.json (root or subdirectories)
+  const pkgPaths = [
+    path.join(cwd, 'package.json'),
+    path.join(cwd, 'frontend', 'package.json'),
+    path.join(cwd, 'backend', 'package.json'),
+  ];
+  const foundPkgs = pkgPaths.filter(p => fs.existsSync(p));
+
+  const allAuditVulns = { critical: 0, high: 0, moderate: 0, low: 0, info: 0, total: 0 };
+  const allDeps = { dependencies: 0, devDependencies: 0 };
+  let outdatedList = [];
+
+  for (const pkgPath of foundPkgs) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (!pkgJson) pkgJson = pkg;
+      allDeps.dependencies += Object.keys(pkg.dependencies || {}).length;
+      allDeps.devDependencies += Object.keys(pkg.devDependencies || {}).length;
+    } catch {}
+
+    const pkgDir = path.dirname(pkgPath);
+    if (fs.existsSync(path.join(pkgDir, 'package-lock.json'))) {
+      try {
+        const auditResult = execSync('npm audit --json 2>/dev/null || true', {
+          cwd: pkgDir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'],
+        });
+        const audit = JSON.parse(auditResult);
+        const vulns = audit.metadata?.vulnerabilities || audit.vulnerabilities || {};
+        for (const sev of ['critical', 'high', 'moderate', 'low', 'info']) {
+          allAuditVulns[sev] += (typeof vulns[sev] === 'number' ? vulns[sev] : 0);
+        }
+        allAuditVulns.total += (typeof vulns.total === 'number' ? vulns.total : 0);
+      } catch {}
+
+      try {
+        const outdatedResult = execSync('npm outdated --json 2>/dev/null || true', {
+          cwd: pkgDir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'],
+        });
+        const outdated = JSON.parse(outdatedResult || '{}');
+        for (const [name, info] of Object.entries(outdated)) {
+          outdatedList.push({ name, current: info.current, wanted: info.wanted, latest: info.latest, location: path.relative(cwd, pkgDir) || '.' });
+        }
+      } catch {}
+    }
   }
 
-  // Quality gate conditions
-  const gateStatus = qualityGate?.projectStatus?.status || 'UNKNOWN';
-  const gateConditions = qualityGate?.projectStatus?.conditions || [];
+  // ── 3. Git info ──
+  console.log('  [..] Reading git history...');
+  let gitBranch = '', gitCommitCount = '', gitLastCommit = '', gitContributors = [];
+  try {
+    gitBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf8' }).trim();
+    gitCommitCount = execSync('git rev-list --count HEAD', { cwd, encoding: 'utf8' }).trim();
+    gitLastCommit = execSync('git log -1 --format="%h - %s (%ar)"', { cwd, encoding: 'utf8' }).trim();
+    const contribRaw = execSync('git shortlog -sn --no-merges HEAD | head -10', { cwd, encoding: 'utf8' }).trim();
+    gitContributors = contribRaw.split('\n').map(l => {
+      const match = l.trim().match(/^(\d+)\s+(.+)$/);
+      return match ? { commits: match[1], name: match[2] } : null;
+    }).filter(Boolean);
+  } catch {}
 
-  // Group issues by severity
+  // ── 4. LGPD rules check ──
+  console.log('  [..] Evaluating LGPD compliance...');
+  let lgpdRules = [];
+  const lgpdRulesPath = path.join(cwd, '.sonarqube-lgpd-rules.json');
+  if (fs.existsSync(lgpdRulesPath)) {
+    try {
+      const lgpdData = JSON.parse(fs.readFileSync(lgpdRulesPath, 'utf8'));
+      lgpdRules = lgpdData.rules || [];
+    } catch {}
+  }
+
+  // Cross-reference LGPD rules with actual issues
   const issueList = issues?.issues || [];
-  const issuesBySeverity = {};
+  const lgpdIssues = [];
+  const lgpdRuleKeys = new Set(lgpdRules.map(r => r.key));
   for (const issue of issueList) {
-    const sev = issue.severity || 'UNKNOWN';
-    if (!issuesBySeverity[sev]) issuesBySeverity[sev] = [];
-    issuesBySeverity[sev].push(issue);
+    if (lgpdRuleKeys.has(issue.rule)) {
+      const rule = lgpdRules.find(r => r.key === issue.rule);
+      lgpdIssues.push({ ...issue, lgpdArticle: rule?.lgpd_article, lgpdName: rule?.name });
+    }
   }
 
-  // Group issues by type
-  const issuesByType = {};
-  for (const issue of issueList) {
-    const t = issue.type || 'UNKNOWN';
-    if (!issuesByType[t]) issuesByType[t] = 0;
-    issuesByType[t]++;
-  }
+  // LGPD compliance score
+  const lgpdChecks = [
+    { label: 'No hardcoded credentials', check: !issueList.some(i => i.rule?.includes('S2068')) },
+    { label: 'HTTPS enforced', check: !issueList.some(i => i.rule?.includes('S5332')) },
+    { label: 'Secure cookies', check: !issueList.some(i => i.rule?.includes('S2255')) },
+    { label: 'No sensitive data in logs', check: !issueList.some(i => i.rule?.includes('S4507')) },
+    { label: 'SQL injection protected', check: !issueList.some(i => i.rule?.includes('S2077') || i.rule?.includes('S3649')) },
+    { label: 'XSS protected', check: !issueList.some(i => i.rule?.includes('S5131')) },
+    { label: 'CORS configured', check: !issueList.some(i => i.rule?.includes('S5122')) },
+    { label: 'Encrypted storage', check: !issueList.some(i => i.rule?.includes('S5443')) },
+    { label: 'Secure random generators', check: !issueList.some(i => i.rule?.includes('S2245')) },
+    { label: 'No hardcoded IPs', check: !issueList.some(i => i.rule?.includes('S1313')) },
+    { label: 'No dependency vulnerabilities (critical)', check: allAuditVulns.critical === 0 },
+    { label: 'No dependency vulnerabilities (high)', check: allAuditVulns.high === 0 },
+  ];
+  const lgpdPassed = lgpdChecks.filter(c => c.check).length;
+  const lgpdScore = Math.round((lgpdPassed / lgpdChecks.length) * 100);
 
-  // Hotspots
-  const hotspotList = hotspots?.hotspots || [];
+  // ── 5. Build HTML ──
+  console.log('  [..] Generating report...\n');
 
   const now = new Date();
   const displayDate = now.toLocaleDateString('pt-BR') + ' ' + now.toLocaleTimeString('pt-BR');
   const projectName = measures.component.name || projectKey;
 
-  // Build issue rows (top 100)
-  const topIssues = issueList.slice(0, 100);
-  const issueRows = topIssues.map(issue => {
+  const ratingLabels = { '1.0': 'A', '2.0': 'B', '3.0': 'C', '4.0': 'D', '5.0': 'E' };
+  const ratingColors = { 'A': '#2ea44f', 'B': '#84bb4c', 'C': '#eabe06', 'D': '#ed7d20', 'E': '#d4333f' };
+  function ratingBadge(value) {
+    const letter = ratingLabels[value] || value || '-';
+    const color = ratingColors[letter] || '#888';
+    return `<span style="background:${color};color:#fff;padding:4px 12px;border-radius:4px;font-size:18px;font-weight:700">${letter}</span>`;
+  }
+  function scoreBadge(score) {
+    const color = score >= 80 ? '#2ea44f' : score >= 60 ? '#eabe06' : score >= 40 ? '#ed7d20' : '#d4333f';
+    return `<span style="background:${color};color:#fff;padding:8px 20px;border-radius:8px;font-size:28px;font-weight:700">${score}%</span>`;
+  }
+
+  const gateStatus = qualityGate?.projectStatus?.status || 'UNKNOWN';
+  const gateConditions = qualityGate?.projectStatus?.conditions || [];
+  const hotspotList = hotspots?.hotspots || [];
+
+  // Health score (weighted)
+  const reliabilityScore = { '1.0': 100, '2.0': 75, '3.0': 50, '4.0': 25, '5.0': 0 };
+  const healthWeights = {
+    reliability: 20, security: 25, maintainability: 15, lgpd: 25, dependencies: 15,
+  };
+  const depScore = allAuditVulns.critical > 0 ? 0 : allAuditVulns.high > 0 ? 30 : allAuditVulns.moderate > 0 ? 60 : 100;
+  const healthScore = Math.round(
+    (reliabilityScore[metricsMap.reliability_rating] || 50) * (healthWeights.reliability / 100) +
+    (reliabilityScore[metricsMap.security_rating] || 50) * (healthWeights.security / 100) +
+    (reliabilityScore[metricsMap.sqale_rating] || 50) * (healthWeights.maintainability / 100) +
+    lgpdScore * (healthWeights.lgpd / 100) +
+    depScore * (healthWeights.dependencies / 100)
+  );
+
+  // Technical debt
+  const debtMinutes = parseInt(metricsMap.sqale_index || '0');
+  const debtDays = Math.round(debtMinutes / 480 * 10) / 10;
+  const debtHours = Math.round(debtMinutes / 60 * 10) / 10;
+
+  // Issues grouped
+  const issuesByType = {};
+  const issuesBySeverity = {};
+  for (const issue of issueList) {
+    const t = issue.type || 'UNKNOWN';
+    const s = issue.severity || 'UNKNOWN';
+    issuesByType[t] = (issuesByType[t] || 0) + 1;
+    issuesBySeverity[s] = (issuesBySeverity[s] || 0) + 1;
+  }
+
+  // Top files by issues
+  const issuesByFile = {};
+  for (const issue of issueList) {
     const file = (issue.component || '').replace(`${projectKey}:`, '');
-    return `<tr>
-      <td>${severityBadge(issue.severity)}</td>
-      <td>${typeBadge(issue.type)}</td>
-      <td>${escapeHtml(issue.message || '')}</td>
-      <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${issue.line || ''}</td>
-    </tr>`;
-  }).join('\n');
+    issuesByFile[file] = (issuesByFile[file] || 0) + 1;
+  }
+  const topFiles = Object.entries(issuesByFile).sort((a, b) => b[1] - a[1]).slice(0, 15);
 
-  // Build hotspot rows
-  const hotspotRows = hotspotList.map(h => {
-    const file = (h.component || '').replace(`${projectKey}:`, '');
-    return `<tr>
-      <td>${severityBadge(h.vulnerabilityProbability || 'MEDIUM')}</td>
-      <td>${escapeHtml(h.securityCategory || '')}</td>
-      <td>${escapeHtml(h.message || '')}</td>
-      <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${h.line || ''}</td>
-      <td>${h.status || ''}</td>
-    </tr>`;
-  }).join('\n');
-
-  // Quality gate condition rows
-  const gateRows = gateConditions.map(c => {
-    const icon = c.status === 'OK' ? '&#10003;' : '&#10007;';
-    const color = c.status === 'OK' ? '#2ea44f' : '#d4333f';
-    return `<tr>
-      <td style="color:${color};font-weight:bold">${icon}</td>
-      <td>${escapeHtml(c.metricKey)}</td>
-      <td>${c.actualValue || '-'}</td>
-      <td>${c.comparator || ''} ${c.errorThreshold || ''}</td>
-      <td style="color:${color};font-weight:bold">${c.status}</td>
-    </tr>`;
-  }).join('\n');
+  // Hotspot categories
+  const hotspotsByCategory = {};
+  for (const h of hotspotList) {
+    const cat = h.securityCategory || 'other';
+    hotspotsByCategory[cat] = (hotspotsByCategory[cat] || 0) + 1;
+  }
 
   const html = `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Quality Report - ${escapeHtml(projectName)}</title>
+<title>Project Report - ${escapeHtml(projectName)}</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #333; background: #f5f5f5; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #333; background: #f5f5f5; line-height: 1.5; }
   .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
-  .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 40px; border-radius: 12px; margin-bottom: 24px; }
-  .header h1 { font-size: 28px; margin-bottom: 8px; }
-  .header p { opacity: 0.8; font-size: 14px; }
-  .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); color: #fff; padding: 48px 40px; border-radius: 16px; margin-bottom: 24px; }
+  .header h1 { font-size: 32px; margin-bottom: 4px; }
+  .header .subtitle { font-size: 16px; opacity: 0.7; margin-bottom: 16px; }
+  .header-meta { display: flex; gap: 32px; flex-wrap: wrap; font-size: 13px; opacity: 0.8; }
+  .card { background: #fff; border-radius: 12px; padding: 28px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
   .card h2 { font-size: 18px; margin-bottom: 16px; color: #1a1a2e; border-bottom: 2px solid #f0f0f0; padding-bottom: 8px; }
-  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
-  .metric { text-align: center; padding: 20px; background: #fafafa; border-radius: 8px; }
-  .metric .value { font-size: 32px; font-weight: 700; color: #1a1a2e; }
-  .metric .label { font-size: 13px; color: #666; margin-top: 4px; }
+  .card h3 { font-size: 15px; margin: 16px 0 8px; color: #444; }
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; }
+  .metric { text-align: center; padding: 20px 12px; background: #fafafa; border-radius: 8px; }
+  .metric .value { font-size: 28px; font-weight: 700; color: #1a1a2e; }
+  .metric .label { font-size: 12px; color: #666; margin-top: 4px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { background: #f8f8f8; text-align: left; padding: 10px 12px; font-weight: 600; border-bottom: 2px solid #eee; }
   td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
   tr:hover { background: #fafafa; }
-  .gate-banner { padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 16px; }
+  .gate-banner { padding: 24px; border-radius: 8px; text-align: center; margin-bottom: 16px; }
   .gate-passed { background: #e6f9e6; border: 1px solid #2ea44f; }
   .gate-failed { background: #fde8e8; border: 1px solid #d4333f; }
+  .flex-row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .flex-row > * { flex: 1; min-width: 300px; }
+  .bar { height: 24px; border-radius: 4px; display: flex; overflow: hidden; margin: 8px 0; }
+  .bar > div { height: 100%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 11px; font-weight: 600; }
+  .check-list { list-style: none; }
+  .check-list li { padding: 6px 0; border-bottom: 1px solid #f5f5f5; font-size: 14px; }
+  .check-list li::before { margin-right: 8px; font-weight: bold; }
+  .check-pass::before { content: "PASS"; color: #2ea44f; }
+  .check-fail::before { content: "FAIL"; color: #d4333f; }
   .summary-bar { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; margin: 16px 0; }
   .summary-item { text-align: center; }
   .summary-item .num { font-size: 24px; font-weight: 700; }
   .summary-item .lbl { font-size: 12px; color: #666; }
-  .footer { text-align: center; padding: 24px; color: #999; font-size: 12px; }
-  @media print { body { background: #fff; } .container { padding: 0; } .card { box-shadow: none; border: 1px solid #eee; } }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin: 1px; }
+  .progress-ring { display: inline-block; position: relative; width: 120px; height: 120px; }
+  .footer { text-align: center; padding: 32px 24px; color: #999; font-size: 12px; }
+  .toc { column-count: 2; column-gap: 24px; font-size: 14px; }
+  .toc a { color: #0f3460; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc li { padding: 3px 0; }
+  .vuln-critical { background: #d4333f; color: #fff; }
+  .vuln-high { background: #ed7d20; color: #fff; }
+  .vuln-moderate { background: #eabe06; color: #333; }
+  .vuln-low { background: #2d9fd9; color: #fff; }
+  @media print {
+    body { background: #fff; font-size: 12px; }
+    .container { padding: 0; }
+    .card { box-shadow: none; border: 1px solid #ddd; break-inside: avoid; }
+    .header { break-after: avoid; }
+  }
 </style>
 </head>
 <body>
 <div class="container">
 
+<!-- ═══ HEADER ═══ -->
 <div class="header">
-  <h1>${escapeHtml(projectName)} - Quality Report</h1>
-  <p>Generated on ${displayDate} by @olympio/quality-config</p>
-  <p>Lines of Code: ${Number(metricsMap.ncloc || 0).toLocaleString('pt-BR')}</p>
+  <h1>${escapeHtml(projectName)}</h1>
+  <div class="subtitle">Project Quality, Security & Compliance Report</div>
+  <div class="header-meta">
+    <div>Date: ${displayDate}</div>
+    <div>Lines of Code: ${Number(metricsMap.ncloc || 0).toLocaleString('pt-BR')}</div>
+    <div>Branch: ${escapeHtml(gitBranch)}</div>
+    <div>Commits: ${gitCommitCount}</div>
+  </div>
 </div>
 
+<!-- ═══ TABLE OF CONTENTS ═══ -->
 <div class="card">
+  <h2>Table of Contents</h2>
+  <ol class="toc">
+    <li><a href="#health">Project Health Score</a></li>
+    <li><a href="#gate">Quality Gate</a></li>
+    <li><a href="#overview">Code Quality Overview</a></li>
+    <li><a href="#security">Security Analysis</a></li>
+    <li><a href="#lgpd">LGPD Compliance</a></li>
+    <li><a href="#deps">Dependencies & Vulnerabilities</a></li>
+    <li><a href="#architecture">Code Architecture</a></li>
+    <li><a href="#debt">Technical Debt</a></li>
+    <li><a href="#hotfiles">Critical Files</a></li>
+    <li><a href="#issues">Detailed Issues</a></li>
+    <li><a href="#git">Repository Activity</a></li>
+    <li><a href="#recommendations">Recommendations</a></li>
+  </ol>
+</div>
+
+<!-- ═══ 1. HEALTH SCORE ═══ -->
+<div class="card" id="health">
+  <h2>1. Project Health Score</h2>
+  <div style="text-align:center;padding:24px 0">
+    ${scoreBadge(healthScore)}
+    <div style="margin-top:12px;font-size:14px;color:#666">
+      Weighted score: Reliability (${healthWeights.reliability}%) + Security (${healthWeights.security}%) + Maintainability (${healthWeights.maintainability}%) + LGPD (${healthWeights.lgpd}%) + Dependencies (${healthWeights.dependencies}%)
+    </div>
+  </div>
+  <div class="metrics-grid" style="margin-top:16px">
+    <div class="metric">
+      <div class="value">${ratingBadge(metricsMap.reliability_rating)}</div>
+      <div class="label">Reliability</div>
+    </div>
+    <div class="metric">
+      <div class="value">${ratingBadge(metricsMap.security_rating)}</div>
+      <div class="label">Security</div>
+    </div>
+    <div class="metric">
+      <div class="value">${ratingBadge(metricsMap.sqale_rating)}</div>
+      <div class="label">Maintainability</div>
+    </div>
+    <div class="metric">
+      <div class="value">${scoreBadge(lgpdScore).replace('font-size:28px', 'font-size:18px')}</div>
+      <div class="label">LGPD Compliance</div>
+    </div>
+    <div class="metric">
+      <div class="value">${scoreBadge(depScore).replace('font-size:28px', 'font-size:18px')}</div>
+      <div class="label">Dependencies</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 2. QUALITY GATE ═══ -->
+<div class="card" id="gate">
+  <h2>2. Quality Gate</h2>
   <div class="gate-banner ${gateStatus === 'OK' ? 'gate-passed' : 'gate-failed'}">
     <div style="font-size:14px;font-weight:600;margin-bottom:8px">QUALITY GATE</div>
     ${qualityGateIcon(gateStatus)}
@@ -620,45 +805,38 @@ async function cmdExport() {
   ${gateConditions.length > 0 ? `
   <table>
     <thead><tr><th></th><th>Metric</th><th>Value</th><th>Threshold</th><th>Status</th></tr></thead>
-    <tbody>${gateRows}</tbody>
+    <tbody>${gateConditions.map(c => {
+      const icon = c.status === 'OK' ? '&#10003;' : '&#10007;';
+      const color = c.status === 'OK' ? '#2ea44f' : '#d4333f';
+      return `<tr><td style="color:${color};font-weight:bold">${icon}</td><td>${escapeHtml(c.metricKey)}</td><td>${c.actualValue || '-'}</td><td>${c.comparator || ''} ${c.errorThreshold || ''}</td><td style="color:${color};font-weight:bold">${c.status}</td></tr>`;
+    }).join('')}</tbody>
   </table>` : ''}
 </div>
 
-<div class="card">
-  <h2>Overview</h2>
+<!-- ═══ 3. OVERVIEW ═══ -->
+<div class="card" id="overview">
+  <h2>3. Code Quality Overview</h2>
   <div class="metrics-grid">
-    <div class="metric">
-      <div class="value">${metricsMap.bugs || '0'}</div>
-      <div class="label">Bugs</div>
-      <div style="margin-top:8px">${ratingBadge(metricsMap.reliability_rating)}</div>
-    </div>
-    <div class="metric">
-      <div class="value">${metricsMap.vulnerabilities || '0'}</div>
-      <div class="label">Vulnerabilities</div>
-      <div style="margin-top:8px">${ratingBadge(metricsMap.security_rating)}</div>
-    </div>
-    <div class="metric">
-      <div class="value">${metricsMap.code_smells || '0'}</div>
-      <div class="label">Code Smells</div>
-      <div style="margin-top:8px">${ratingBadge(metricsMap.sqale_rating)}</div>
-    </div>
-    <div class="metric">
-      <div class="value">${metricsMap.security_hotspots || '0'}</div>
-      <div class="label">Security Hotspots</div>
-    </div>
-    <div class="metric">
-      <div class="value">${metricsMap.coverage ? metricsMap.coverage + '%' : 'N/A'}</div>
-      <div class="label">Coverage</div>
-    </div>
-    <div class="metric">
-      <div class="value">${metricsMap.duplicated_lines_density ? metricsMap.duplicated_lines_density + '%' : 'N/A'}</div>
-      <div class="label">Duplications</div>
-    </div>
+    <div class="metric"><div class="value">${metricsMap.bugs || '0'}</div><div class="label">Bugs</div></div>
+    <div class="metric"><div class="value">${metricsMap.vulnerabilities || '0'}</div><div class="label">Vulnerabilities</div></div>
+    <div class="metric"><div class="value">${metricsMap.code_smells || '0'}</div><div class="label">Code Smells</div></div>
+    <div class="metric"><div class="value">${metricsMap.security_hotspots || '0'}</div><div class="label">Security Hotspots</div></div>
+    <div class="metric"><div class="value">${metricsMap.coverage ? metricsMap.coverage + '%' : 'N/A'}</div><div class="label">Test Coverage</div></div>
+    <div class="metric"><div class="value">${metricsMap.duplicated_lines_density ? metricsMap.duplicated_lines_density + '%' : 'N/A'}</div><div class="label">Duplications</div></div>
   </div>
-</div>
 
-<div class="card">
-  <h2>Issues by Type</h2>
+  <h3>Issues by Severity</h3>
+  <div class="bar">
+    ${['BLOCKER', 'CRITICAL', 'MAJOR', 'MINOR', 'INFO'].map(sev => {
+      const count = issuesBySeverity[sev] || 0;
+      if (count === 0) return '';
+      const colors = { BLOCKER: '#d4333f', CRITICAL: '#e05555', MAJOR: '#ed7d20', MINOR: '#eabe06', INFO: '#2d9fd9' };
+      const pct = Math.max((count / issueList.length) * 100, 5);
+      return `<div style="background:${colors[sev]};width:${pct}%">${sev} ${count}</div>`;
+    }).join('')}
+  </div>
+
+  <h3>Issues by Type</h3>
   <div class="summary-bar">
     ${Object.entries(issuesByType).map(([type, count]) =>
       `<div class="summary-item"><div class="num">${count}</div><div class="lbl">${typeBadge(type)}</div></div>`
@@ -666,25 +844,232 @@ async function cmdExport() {
   </div>
 </div>
 
-${hotspotList.length > 0 ? `
-<div class="card">
-  <h2>Security Hotspots (${hotspotList.length})</h2>
+<!-- ═══ 4. SECURITY ═══ -->
+<div class="card" id="security">
+  <h2>4. Security Analysis</h2>
+  <div class="flex-row">
+    <div>
+      <h3>Security Hotspots by Category</h3>
+      ${Object.keys(hotspotsByCategory).length > 0 ? `
+      <table>
+        <thead><tr><th>Category</th><th>Count</th></tr></thead>
+        <tbody>${Object.entries(hotspotsByCategory).sort((a,b) => b[1]-a[1]).map(([cat, count]) =>
+          `<tr><td>${escapeHtml(cat)}</td><td><strong>${count}</strong></td></tr>`
+        ).join('')}</tbody>
+      </table>` : '<p style="color:#666">No security hotspots found.</p>'}
+    </div>
+    <div>
+      <h3>Vulnerability Summary</h3>
+      <div class="metrics-grid">
+        <div class="metric"><div class="value">${metricsMap.vulnerabilities || '0'}</div><div class="label">Code Vulnerabilities</div></div>
+        <div class="metric"><div class="value">${allAuditVulns.total}</div><div class="label">Dependency Vulnerabilities</div></div>
+      </div>
+    </div>
+  </div>
+  ${hotspotList.length > 0 ? `
+  <h3>Security Hotspots Detail</h3>
   <table>
     <thead><tr><th>Risk</th><th>Category</th><th>Description</th><th>File</th><th>Status</th></tr></thead>
-    <tbody>${hotspotRows}</tbody>
-  </table>
-</div>` : ''}
+    <tbody>${hotspotList.map(h => {
+      const file = (h.component || '').replace(`${projectKey}:`, '');
+      return `<tr>
+        <td>${severityBadge(h.vulnerabilityProbability || 'MEDIUM')}</td>
+        <td>${escapeHtml(h.securityCategory || '')}</td>
+        <td>${escapeHtml(h.message || '')}</td>
+        <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${h.line || ''}</td>
+        <td>${h.status || ''}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>` : ''}
+</div>
 
-<div class="card">
-  <h2>Issues (top ${topIssues.length} of ${issueList.length})</h2>
+<!-- ═══ 5. LGPD ═══ -->
+<div class="card" id="lgpd">
+  <h2>5. LGPD Compliance (Lei Geral de Prote&ccedil;&atilde;o de Dados)</h2>
+  <div style="text-align:center;padding:16px 0">
+    ${scoreBadge(lgpdScore)}
+    <div style="margin-top:8px;font-size:13px;color:#666">${lgpdPassed}/${lgpdChecks.length} checks passed</div>
+  </div>
+
+  <h3>Automated Checks (Art. 46 - Security)</h3>
+  <ul class="check-list">
+    ${lgpdChecks.map(c => `<li class="${c.check ? 'check-pass' : 'check-fail'}">${escapeHtml(c.label)}</li>`).join('')}
+  </ul>
+
+  ${lgpdIssues.length > 0 ? `
+  <h3>LGPD-Related Issues Found (${lgpdIssues.length})</h3>
   <table>
-    <thead><tr><th>Severity</th><th>Type</th><th>Description</th><th>File</th></tr></thead>
-    <tbody>${issueRows}</tbody>
+    <thead><tr><th>LGPD Article</th><th>Rule</th><th>Description</th><th>File</th></tr></thead>
+    <tbody>${lgpdIssues.slice(0, 50).map(i => {
+      const file = (i.component || '').replace(`${projectKey}:`, '');
+      return `<tr>
+        <td><strong>${escapeHtml(i.lgpdArticle || '')}</strong></td>
+        <td>${escapeHtml(i.lgpdName || i.rule || '')}</td>
+        <td>${escapeHtml(i.message || '')}</td>
+        <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${i.line || ''}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>` : '<p style="color:#2ea44f;font-weight:600;margin-top:12px">No LGPD-related issues found in code analysis.</p>'}
+
+  <h3 style="margin-top:20px">Manual Review Checklist</h3>
+  <table>
+    <thead><tr><th>Category</th><th>Requirement</th><th>LGPD Article</th></tr></thead>
+    <tbody>
+      <tr><td>Consent</td><td>Explicit consent collection implemented</td><td>Art. 7 - Legal basis</td></tr>
+      <tr><td>Consent</td><td>Consent revocation mechanism available</td><td>Art. 8 - Consent requirements</td></tr>
+      <tr><td>Data Rights</td><td>Data access endpoint for users</td><td>Art. 18 - Data subject rights</td></tr>
+      <tr><td>Data Rights</td><td>Data deletion (right to be forgotten)</td><td>Art. 18 - Data subject rights</td></tr>
+      <tr><td>Data Rights</td><td>Data portability export</td><td>Art. 18 - Data subject rights</td></tr>
+      <tr><td>Governance</td><td>DPO (Data Protection Officer) designated</td><td>Art. 41 - DPO</td></tr>
+      <tr><td>Governance</td><td>Data inventory maintained</td><td>Art. 37 - Records</td></tr>
+      <tr><td>Governance</td><td>Incident response plan documented</td><td>Art. 48 - Incident notification</td></tr>
+      <tr><td>Governance</td><td>Data retention policies defined</td><td>Art. 16 - Data elimination</td></tr>
+      <tr><td>Privacy</td><td>Privacy policy published and up-to-date</td><td>Art. 9 - Access to information</td></tr>
+    </tbody>
   </table>
 </div>
 
+<!-- ═══ 6. DEPENDENCIES ═══ -->
+<div class="card" id="deps">
+  <h2>6. Dependencies & Vulnerabilities</h2>
+  <div class="metrics-grid">
+    <div class="metric"><div class="value">${allDeps.dependencies}</div><div class="label">Dependencies</div></div>
+    <div class="metric"><div class="value">${allDeps.devDependencies}</div><div class="label">Dev Dependencies</div></div>
+    <div class="metric"><div class="value" style="color:${allAuditVulns.critical > 0 ? '#d4333f' : '#2ea44f'}">${allAuditVulns.critical}</div><div class="label">Critical Vulns</div></div>
+    <div class="metric"><div class="value" style="color:${allAuditVulns.high > 0 ? '#ed7d20' : '#2ea44f'}">${allAuditVulns.high}</div><div class="label">High Vulns</div></div>
+    <div class="metric"><div class="value">${allAuditVulns.moderate}</div><div class="label">Moderate Vulns</div></div>
+    <div class="metric"><div class="value">${allAuditVulns.low}</div><div class="label">Low Vulns</div></div>
+  </div>
+
+  ${outdatedList.length > 0 ? `
+  <h3>Outdated Packages (${outdatedList.length})</h3>
+  <table>
+    <thead><tr><th>Package</th><th>Current</th><th>Wanted</th><th>Latest</th><th>Location</th></tr></thead>
+    <tbody>${outdatedList.slice(0, 30).map(o =>
+      `<tr><td><strong>${escapeHtml(o.name)}</strong></td><td>${o.current}</td><td>${o.wanted}</td><td>${o.latest}</td><td style="font-size:12px">${escapeHtml(o.location)}</td></tr>`
+    ).join('')}</tbody>
+  </table>` : '<p style="color:#2ea44f;margin-top:12px">All dependencies are up to date.</p>'}
+</div>
+
+<!-- ═══ 7. ARCHITECTURE ═══ -->
+<div class="card" id="architecture">
+  <h2>7. Code Architecture</h2>
+  <div class="metrics-grid">
+    <div class="metric"><div class="value">${Number(metricsMap.ncloc || 0).toLocaleString('pt-BR')}</div><div class="label">Lines of Code</div></div>
+    <div class="metric"><div class="value">${metricsMap.files || '-'}</div><div class="label">Files</div></div>
+    <div class="metric"><div class="value">${metricsMap.functions || '-'}</div><div class="label">Functions</div></div>
+    <div class="metric"><div class="value">${metricsMap.classes || '-'}</div><div class="label">Classes</div></div>
+    <div class="metric"><div class="value">${metricsMap.statements || '-'}</div><div class="label">Statements</div></div>
+    <div class="metric"><div class="value">${metricsMap.complexity || '-'}</div><div class="label">Cyclomatic Complexity</div></div>
+    <div class="metric"><div class="value">${metricsMap.cognitive_complexity || '-'}</div><div class="label">Cognitive Complexity</div></div>
+    <div class="metric"><div class="value">${metricsMap.duplicated_blocks || '-'}</div><div class="label">Duplicated Blocks</div></div>
+  </div>
+</div>
+
+<!-- ═══ 8. TECH DEBT ═══ -->
+<div class="card" id="debt">
+  <h2>8. Technical Debt</h2>
+  <div class="metrics-grid">
+    <div class="metric"><div class="value">${debtDays}d</div><div class="label">Total Debt (days)</div></div>
+    <div class="metric"><div class="value">${debtHours}h</div><div class="label">Total Debt (hours)</div></div>
+    <div class="metric"><div class="value">${metricsMap.sqale_debt_ratio ? metricsMap.sqale_debt_ratio + '%' : '-'}</div><div class="label">Debt Ratio</div></div>
+    <div class="metric"><div class="value">${ratingBadge(metricsMap.sqale_rating)}</div><div class="label">Maintainability Rating</div></div>
+  </div>
+</div>
+
+<!-- ═══ 9. CRITICAL FILES ═══ -->
+<div class="card" id="hotfiles">
+  <h2>9. Files with Most Issues</h2>
+  ${topFiles.length > 0 ? `
+  <table>
+    <thead><tr><th>File</th><th>Issues</th><th>Distribution</th></tr></thead>
+    <tbody>${topFiles.map(([file, count]) => {
+      const pct = Math.round((count / issueList.length) * 100);
+      return `<tr>
+        <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}</td>
+        <td><strong>${count}</strong></td>
+        <td><div style="background:#eee;border-radius:3px;height:16px;width:200px"><div style="background:#0f3460;height:100%;width:${Math.min(pct * 3, 100)}%;border-radius:3px"></div></div></td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>` : ''}
+</div>
+
+<!-- ═══ 10. ISSUES ═══ -->
+<div class="card" id="issues">
+  <h2>10. Detailed Issues (top ${Math.min(issueList.length, 100)} of ${issueList.length})</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Type</th><th>Description</th><th>File</th></tr></thead>
+    <tbody>${issueList.slice(0, 100).map(issue => {
+      const file = (issue.component || '').replace(`${projectKey}:`, '');
+      return `<tr>
+        <td>${severityBadge(issue.severity)}</td>
+        <td>${typeBadge(issue.type)}</td>
+        <td>${escapeHtml(issue.message || '')}</td>
+        <td style="font-family:monospace;font-size:12px">${escapeHtml(file)}:${issue.line || ''}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>
+</div>
+
+<!-- ═══ 11. GIT ═══ -->
+<div class="card" id="git">
+  <h2>11. Repository Activity</h2>
+  <div class="flex-row">
+    <div>
+      <h3>Summary</h3>
+      <table>
+        <tr><td>Branch</td><td><strong>${escapeHtml(gitBranch)}</strong></td></tr>
+        <tr><td>Total commits</td><td><strong>${gitCommitCount}</strong></td></tr>
+        <tr><td>Last commit</td><td>${escapeHtml(gitLastCommit)}</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>Top Contributors</h3>
+      ${gitContributors.length > 0 ? `
+      <table>
+        <thead><tr><th>Name</th><th>Commits</th></tr></thead>
+        <tbody>${gitContributors.map(c =>
+          `<tr><td>${escapeHtml(c.name)}</td><td><strong>${c.commits}</strong></td></tr>`
+        ).join('')}</tbody>
+      </table>` : '<p style="color:#666">No contributor data available.</p>'}
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 12. RECOMMENDATIONS ═══ -->
+<div class="card" id="recommendations">
+  <h2>12. Recommendations</h2>
+
+  <h3>Critical Priority</h3>
+  <ul>
+    ${allAuditVulns.critical > 0 ? `<li>Fix <strong>${allAuditVulns.critical} critical</strong> dependency vulnerabilities immediately (<code>npm audit fix</code>)</li>` : ''}
+    ${allAuditVulns.high > 0 ? `<li>Address <strong>${allAuditVulns.high} high</strong> severity dependency vulnerabilities</li>` : ''}
+    ${(issuesBySeverity.BLOCKER || 0) > 0 ? `<li>Resolve <strong>${issuesBySeverity.BLOCKER} blocker</strong> code issues</li>` : ''}
+    ${(issuesBySeverity.CRITICAL || 0) > 0 ? `<li>Fix <strong>${issuesBySeverity.CRITICAL} critical</strong> code issues</li>` : ''}
+    ${hotspotList.length > 0 ? `<li>Review <strong>${hotspotList.length} security hotspots</strong> (blocking quality gate)</li>` : ''}
+    ${lgpdIssues.length > 0 ? `<li>Fix <strong>${lgpdIssues.length} LGPD-related</strong> code violations</li>` : ''}
+    ${allAuditVulns.critical === 0 && allAuditVulns.high === 0 && (issuesBySeverity.BLOCKER || 0) === 0 && (issuesBySeverity.CRITICAL || 0) === 0 && hotspotList.length === 0 && lgpdIssues.length === 0 ? '<li style="color:#2ea44f">No critical issues found.</li>' : ''}
+  </ul>
+
+  <h3>High Priority</h3>
+  <ul>
+    ${!metricsMap.coverage || metricsMap.coverage === '0.0' ? '<li>Implement test coverage (currently 0%)</li>' : ''}
+    ${parseFloat(metricsMap.duplicated_lines_density || '0') > 5 ? `<li>Reduce code duplication (${metricsMap.duplicated_lines_density}% duplicated)</li>` : ''}
+    ${debtDays > 10 ? `<li>Address technical debt (${debtDays} days of remediation effort)</li>` : ''}
+    ${topFiles.length > 0 && topFiles[0][1] > 20 ? `<li>Refactor <code>${escapeHtml(topFiles[0][0])}</code> (${topFiles[0][1]} issues)</li>` : ''}
+  </ul>
+
+  <h3>LGPD Compliance</h3>
+  <ul>
+    ${lgpdChecks.filter(c => !c.check).map(c => `<li>${escapeHtml(c.label)}</li>`).join('')}
+    ${lgpdChecks.every(c => c.check) ? '<li style="color:#2ea44f">All automated LGPD checks pass.</li>' : ''}
+    <li>Complete manual review checklist (Section 5)</li>
+  </ul>
+</div>
+
 <div class="footer">
-  Generated by @olympio/quality-config | ${displayDate}
+  Generated by <strong>@olympio/quality-config</strong> | ${displayDate}<br>
+  This report is auto-generated from SonarQube analysis, dependency audit, and git history.
 </div>
 
 </div>
@@ -700,7 +1085,6 @@ ${hotspotList.length > 0 ? `
   console.log(`  [ok] Report exported: ${path.relative(cwd, reportFile)}`);
   console.log(`  Open in browser or send to client.\n`);
 
-  // Try to open in browser
   try {
     const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
     execSync(`${openCmd} "${reportFile}"`, { stdio: 'ignore' });
