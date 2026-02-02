@@ -1,6 +1,6 @@
 {
   "name": "@olympio/quality-config",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Unified quality, security and LGPD compliance tooling for multi-stack projects",
   "main": "index.js",
   "bin": {
@@ -9,8 +9,6 @@
   "files": [
     "bin/",
     "configs/",
-    "workflows/",
-    "scripts/",
     "templates/",
     "index.js"
   ],

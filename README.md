@@ -16,36 +16,33 @@ Unified quality, security and LGPD compliance tooling for multi-stack projects.
 ## Installation
 
 ```bash
-npm install -g @olympio/quality-config
-```
-
-Or run without installing:
-
-```bash
-npx @olympio/quality-config init --stack react --project-key my-app
+npm install -D @olympio/quality-config
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Initialize in your project
-quality-config init --stack nextjs --project-key my-app
+# 1. Initialize configs
+npx quality-config init --stack nextjs --project-key my-app
 
-# 2. Start local SonarQube
-docker compose -f docker-compose.sonar.yml up -d
+# 2. Install pre-push hook
+npx quality-config hook install
 
 # 3. Verify setup
-quality-config doctor
+npx quality-config doctor
+
+# 4. Run scan manually
+npx quality-config scan
 ```
 
 ## Commands
 
 ### `quality-config init`
 
-Generates all quality and compliance configs in the current project.
+Generates all quality and compliance config files in the current project.
 
 ```bash
-quality-config init --stack <stack> [options]
+npx quality-config init --stack <stack> [options]
 ```
 
 | Option | Description |
@@ -55,7 +52,7 @@ quality-config init --stack <stack> [options]
 | `--project-name <name>` | SonarQube display name (defaults to folder name) |
 | `--skip-workflow` | Skip GitHub Actions workflow generation |
 | `--skip-docker` | Skip docker-compose generation |
-| `--skip-lgpd` | Skip LGPD compliance configs |
+| `--skip-lgpd` | Skip LGPD compliance rules |
 
 **Generated files:**
 
@@ -64,19 +61,45 @@ your-project/
 ├── sonar-project.properties        # SonarQube config (stack-specific)
 ├── docker-compose.sonar.yml        # Local SonarQube server
 ├── .sonarqube-lgpd-rules.json      # LGPD/GDPR compliance rules
-├── .github/
-│   └── workflows/
-│       └── sonarqube.yml           # CI pipeline (scan + quality gate)
-└── scripts/
-    └── generate-lgpd-report.sh     # LGPD compliance report generator
+└── .github/
+    └── workflows/
+        └── sonarqube.yml           # CI pipeline (scan + quality gate)
+```
+
+### `quality-config scan`
+
+Runs a full SonarQube analysis via Docker. Automatically starts SonarQube if not running, generates a token, and runs the scanner.
+
+```bash
+npx quality-config scan
+```
+
+Requires Docker to be running.
+
+### `quality-config hook install`
+
+Installs a git `pre-push` hook that runs `quality-config scan` before every push. If the scan fails, the push is blocked.
+
+```bash
+npx quality-config hook install
+```
+
+Skip the hook on a specific push with `git push --no-verify`.
+
+### `quality-config hook uninstall`
+
+Removes the pre-push hook.
+
+```bash
+npx quality-config hook uninstall
 ```
 
 ### `quality-config doctor`
 
-Checks if all quality configs are present and valid. Warns about hardcoded tokens and missing environment variables.
+Checks if all quality configs are present and valid. Verifies Docker, git hooks, and warns about hardcoded tokens.
 
 ```bash
-quality-config doctor
+npx quality-config doctor
 ```
 
 ### `quality-config report`
@@ -84,15 +107,15 @@ quality-config doctor
 Generates an LGPD compliance report in `reports/lgpd/`.
 
 ```bash
-quality-config report
+npx quality-config report
 ```
 
 ### `quality-config update`
 
-Updates shared configs (docker-compose, scripts) to the latest version without overwriting project-specific settings like `sonar-project.properties`.
+Updates shared configs (docker-compose) to the latest version without overwriting project-specific settings like `sonar-project.properties`.
 
 ```bash
-quality-config update
+npx quality-config update
 ```
 
 ## CI/CD Setup
