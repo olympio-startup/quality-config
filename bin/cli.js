@@ -138,6 +138,10 @@ function waitForSonarQube(cwd, maxRetries = 60) {
 }
 
 function getSonarToken(cwd) {
+  if (process.env.SONAR_TOKEN && String(process.env.SONAR_TOKEN).trim()) {
+    return String(process.env.SONAR_TOKEN).trim();
+  }
+
   const tokenFile = path.join(cwd, '.sonar-token');
   if (fs.existsSync(tokenFile)) {
     return fs.readFileSync(tokenFile, 'utf8').trim();
@@ -420,14 +424,49 @@ function cmdDoctor() {
 
 function sonarApiFetch(endpoint, token, sonarUrl = 'http://localhost:9000') {
   try {
+    // SonarQube tokens are typically used via Basic Auth: token as username, empty password.
+    // (Bearer is not consistently supported across SonarQube versions/setups.)
     const result = execSync(
-      `curl -sf -H "Authorization: Bearer ${token}" "${sonarUrl}${endpoint}"`,
+      `curl -sf -u "${token}:" "${sonarUrl}${endpoint}"`,
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }
     );
     return JSON.parse(result);
   } catch {
     return null;
   }
+}
+
+function sonarApiFetchPaged({ endpoint, token, sonarUrl, itemsKey, pageSize = 500, maxItems = 5000 }) {
+  const allItems = [];
+  let page = 1;
+  let total = null;
+  let lastResponse = null;
+
+  while (allItems.length < maxItems) {
+    const sep = endpoint.includes('?') ? '&' : '?';
+    const response = sonarApiFetch(`${endpoint}${sep}p=${page}&ps=${pageSize}`, token, sonarUrl);
+    if (!response) break;
+
+    lastResponse = response;
+    const items = Array.isArray(response[itemsKey]) ? response[itemsKey] : [];
+    allItems.push(...items);
+
+    total = typeof response.paging?.total === 'number' ? response.paging.total : total;
+    if (items.length === 0) break;
+    if (typeof total === 'number' && allItems.length >= total) break;
+
+    page += 1;
+  }
+
+  if (!lastResponse) return null;
+  return {
+    ...lastResponse,
+    [itemsKey]: allItems.slice(0, maxItems),
+    paging: {
+      ...lastResponse.paging,
+      total: typeof total === 'number' ? total : allItems.length,
+    },
+  };
 }
 
 function severityBadge(severity) {
@@ -475,14 +514,22 @@ async function cmdExport() {
     `/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density,ncloc,sqale_index,sqale_debt_ratio,security_rating,reliability_rating,sqale_rating,alert_status,complexity,cognitive_complexity,duplicated_blocks,duplicated_files,files,functions,classes,statements`,
     token, sonarUrl
   );
-  const issues = sonarApiFetch(
-    `/api/issues/search?componentKeys=${projectKey}&ps=500&s=SEVERITY&asc=false&statuses=OPEN,CONFIRMED,REOPENED`,
-    token, sonarUrl
-  );
-  const hotspots = sonarApiFetch(
-    `/api/hotspots/search?projectKey=${projectKey}&ps=500`,
-    token, sonarUrl
-  );
+  const issues = sonarApiFetchPaged({
+    endpoint: `/api/issues/search?componentKeys=${encodeURIComponent(projectKey)}&s=SEVERITY&asc=false&statuses=OPEN,CONFIRMED,REOPENED`,
+    token,
+    sonarUrl,
+    itemsKey: 'issues',
+    pageSize: 500,
+    maxItems: 5000,
+  });
+  const hotspots = sonarApiFetchPaged({
+    endpoint: `/api/hotspots/search?projectKey=${encodeURIComponent(projectKey)}`,
+    token,
+    sonarUrl,
+    itemsKey: 'hotspots',
+    pageSize: 500,
+    maxItems: 5000,
+  });
 
   if (!measures || !measures.component) {
     console.error('  [error] Could not fetch project data. Is SonarQube running?');
@@ -532,7 +579,13 @@ async function cmdExport() {
         for (const sev of ['critical', 'high', 'moderate', 'low', 'info']) {
           allAuditVulns[sev] += (typeof vulns[sev] === 'number' ? vulns[sev] : 0);
         }
-        allAuditVulns.total += (typeof vulns.total === 'number' ? vulns.total : 0);
+        if (typeof vulns.total === 'number') {
+          allAuditVulns.total += vulns.total;
+        } else {
+          allAuditVulns.total += ['critical', 'high', 'moderate', 'low', 'info'].reduce((sum, sev) => {
+            return sum + (typeof vulns[sev] === 'number' ? vulns[sev] : 0);
+          }, 0);
+        }
       } catch {}
 
       try {
@@ -575,26 +628,44 @@ async function cmdExport() {
   // Cross-reference LGPD rules with actual issues
   const issueList = issues?.issues || [];
   const lgpdIssues = [];
-  const lgpdRuleKeys = new Set(lgpdRules.map(r => r.key));
+  const lgpdRuleKeysExact = new Set(lgpdRules.map(r => r.key).filter(Boolean));
+  const lgpdRuleSuffixes = new Set(lgpdRules.map(r => (r.key || '').split(':').pop()).filter(Boolean));
   for (const issue of issueList) {
-    if (lgpdRuleKeys.has(issue.rule)) {
-      const rule = lgpdRules.find(r => r.key === issue.rule);
+    const issueRule = issue.rule || '';
+    const suffix = issueRule.split(':').pop();
+    if (lgpdRuleKeysExact.has(issueRule) || lgpdRuleSuffixes.has(suffix)) {
+      const rule = lgpdRules.find(r => r.key === issueRule) || lgpdRules.find(r => (r.key || '').split(':').pop() === suffix);
       lgpdIssues.push({ ...issue, lgpdArticle: rule?.lgpd_article, lgpdName: rule?.name });
     }
   }
 
   // LGPD compliance score
+  function issueRuleRepo(issue) {
+    const rule = issue.rule || '';
+    return rule.includes(':') ? rule.split(':')[0] : rule;
+  }
+  function issueRuleSuffix(issue) {
+    const rule = issue.rule || '';
+    return rule.includes(':') ? rule.split(':').pop() : rule;
+  }
+  function hasAnyRuleSuffix(suffixes) {
+    const set = new Set(suffixes);
+    return issueList.some(i => set.has(issueRuleSuffix(i)));
+  }
+  function hasSecretsIssues() {
+    return issueList.some(i => issueRuleRepo(i) === 'secrets');
+  }
   const lgpdChecks = [
-    { label: 'No hardcoded credentials', check: !issueList.some(i => i.rule?.includes('S2068')) },
-    { label: 'HTTPS enforced', check: !issueList.some(i => i.rule?.includes('S5332')) },
-    { label: 'Secure cookies', check: !issueList.some(i => i.rule?.includes('S2255')) },
-    { label: 'No sensitive data in logs', check: !issueList.some(i => i.rule?.includes('S4507')) },
-    { label: 'SQL injection protected', check: !issueList.some(i => i.rule?.includes('S2077') || i.rule?.includes('S3649')) },
-    { label: 'XSS protected', check: !issueList.some(i => i.rule?.includes('S5131')) },
-    { label: 'CORS configured', check: !issueList.some(i => i.rule?.includes('S5122')) },
-    { label: 'Encrypted storage', check: !issueList.some(i => i.rule?.includes('S5443')) },
-    { label: 'Secure random generators', check: !issueList.some(i => i.rule?.includes('S2245')) },
-    { label: 'No hardcoded IPs', check: !issueList.some(i => i.rule?.includes('S1313')) },
+    { label: 'No hardcoded credentials / secrets', check: !(hasAnyRuleSuffix(['S2068']) || hasSecretsIssues()) },
+    { label: 'HTTPS enforced', check: !hasAnyRuleSuffix(['S5332']) },
+    { label: 'Secure cookies', check: !hasAnyRuleSuffix(['S2255']) },
+    { label: 'No sensitive data in logs', check: !hasAnyRuleSuffix(['S4507']) },
+    { label: 'SQL injection protected', check: !hasAnyRuleSuffix(['S2077', 'S3649']) },
+    { label: 'XSS protected', check: !hasAnyRuleSuffix(['S5131']) },
+    { label: 'CORS configured', check: !hasAnyRuleSuffix(['S5122']) },
+    { label: 'Encrypted storage', check: !hasAnyRuleSuffix(['S5443']) },
+    { label: 'Secure random generators', check: !hasAnyRuleSuffix(['S2245']) },
+    { label: 'No hardcoded IPs', check: !hasAnyRuleSuffix(['S1313']) },
     { label: 'No dependency vulnerabilities (critical)', check: allAuditVulns.critical === 0 },
     { label: 'No dependency vulnerabilities (high)', check: allAuditVulns.high === 0 },
   ];

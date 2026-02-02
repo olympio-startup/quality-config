@@ -79,6 +79,12 @@ npx quality-config scan
 
 Requires Docker to be running.
 
+You can also provide an existing token via `SONAR_TOKEN`:
+
+```bash
+SONAR_TOKEN="..." SONAR_HOST_URL="https://sonar.yourcompany.com" npx quality-config scan
+```
+
 ### `quality-config hook install`
 
 Installs a git `pre-push` hook that runs `quality-config scan` before every push. If the scan fails, the push is blocked.
@@ -122,7 +128,13 @@ npx quality-config export
 **Notes:**
 
 - Uses `SONAR_HOST_URL` when set; otherwise defaults to `http://localhost:9000`
-- Needs a Sonar token (it will use `.sonar-token` if present; otherwise it will try to generate one when running against local SonarQube with default credentials)
+- Needs a Sonar token: use `SONAR_TOKEN="..."` or `.sonar-token` (if missing, it will try to generate one only when running against local SonarQube with default credentials)
+
+Example:
+
+```bash
+SONAR_TOKEN="..." SONAR_HOST_URL="https://sonar.yourcompany.com" npx quality-config export
+```
 
 ### `quality-config report`
 
